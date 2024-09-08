@@ -1,4 +1,5 @@
 import hashlib
+import time
 import re
 
 from .common import InfoExtractor
@@ -8,6 +9,7 @@ from ..utils import (
     float_or_none,
     int_or_none,
     join_nonempty,
+    jwt_encode_hs256,
     merge_dicts,
     unified_strdate,
 )
@@ -18,24 +20,72 @@ class ProSiebenSat1BaseIE(InfoExtractor):
     _ACCESS_ID = None
     _SUPPORTED_PROTOCOLS = 'dash:clear,hls:clear,progressive:clear'
     _V4_BASE_URL = 'https://vas-v4.p7s1video.net/4.0/get'
+    _JWT_ENCRYPTION_KEY = 'ox6eWairaiwighohboofooneephaecus'  # from ran.de webpack:///source-fetcher/src/decode-config.ts
+
+    def _build_jwt(self, clip_id):
+        now = int(time.time())
+        five_min = 60 * 5
+
+        payload = {
+            'content_ids': {
+                clip_id: {}
+            },
+            'secure_delivery': True,
+            'iat': now,  # initialized at
+            'nbf': now - five_min,  # not before
+            'exp': now + five_min,  # expiration time
+        }
+
+        headers = {
+            'kid': 'x_ran-de'
+        }
+
+        return jwt_encode_hs256(payload, self._JWT_ENCRYPTION_KEY, headers)
 
     def _extract_video_info(self, url, clip_id):
         client_location = url
 
-        video = self._download_json(
-            'http://vas.sim-technik.de/vas/live/v2/videos',
-            clip_id, 'Downloading videos JSON', query={
-                'access_token': self._TOKEN,
-                'client_location': client_location,
-                'client_name': self._CLIENT_NAME,
-                'ids': clip_id,
-            })[0]
+        if clip_id.startswith('v_'):
+            clip_info_token = self._build_jwt(clip_id)
+            video = self._download_json(
+                self._V4_BASE_URL + 'sources',
+                clip_id, 'Downloading sources JSON', query={
+                    'token': clip_info_token,
+                }
+            )['data'][clip_id]
+
+        else:
+            video = self._download_json(
+                'http://vas.sim-technik.de/vas/live/v2/videos',
+                clip_id, 'Downloading videos JSON', query={
+                    'access_token': self._TOKEN,
+                    'client_location': client_location,
+                    'client_name': self._CLIENT_NAME,
+                    'ids': clip_id,
+                })[0]
 
         if not self.get_param('allow_unplayable_formats') and video.get('is_protected') is True:
             self.report_drm(clip_id)
 
         formats = []
-        if self._ACCESS_ID:
+        if clip_id.startswith('v_'):
+            for protocol, protocol_info in video['urls'].items():
+                protocol_url = protocol_info['clear']['url']
+                if protocol == 'dash':
+                    formats.extend(self._extract_mpd_formats(
+                        protocol_url, clip_id, mpd_id=protocol, fatal=False
+                    ))
+                elif protocol == 'hls':
+                    formats.extend(self._extract_m3u8_formats(
+                        protocol_url, clip_id, 'mp4', 'm3u8_native',
+                        m3u8_id=protocol, fatal=False
+                    ))
+                else:
+                    formats.append({
+                        'url': protocol_url,
+                        'format_id': protocol,
+                    })
+        elif self._ACCESS_ID:
             raw_ct = self._ENCRYPTION_KEY + clip_id + self._IV + self._ACCESS_ID
             protocols = self._download_json(
                 self._V4_BASE_URL + 'protocols', clip_id,
@@ -390,6 +440,7 @@ class ProSiebenSat1IE(ProSiebenSat1BaseIE):
         r"'itemImageUrl'\s*:\s*'/dynamic/thumbnails/full/\d+/(\d+)",
         r'proMamsId&quot;\s*:\s*&quot;(\d+)',
         r'proMamsId"\s*:\s*"(\d+)',
+        r'"contentUrl":"https://vas-v4.p7s1video.net/4.0/videositemap/geturl/(v_\w+)"',
     ]
     _TITLE_REGEXES = [
         r'<h2 class="subtitle" itemprop="name">\s*(.+?)</h2>',
