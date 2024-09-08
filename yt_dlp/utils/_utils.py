@@ -4707,10 +4707,10 @@ def jwt_encode_hs256(payload_data, key, headers={}):
     }
     if headers:
         header_data.update(headers)
-    header_b64 = base64.b64encode(json.dumps(header_data).encode())
-    payload_b64 = base64.b64encode(json.dumps(payload_data).encode())
+    header_b64 = base64.urlsafe_b64encode(json.dumps(header_data).encode()).rstrip(b'=')
+    payload_b64 = base64.urlsafe_b64encode(json.dumps(payload_data).encode()).rstrip(b'=')
     h = hmac.new(key.encode(), header_b64 + b'.' + payload_b64, hashlib.sha256)
-    signature_b64 = base64.b64encode(h.digest())
+    signature_b64 = base64.urlsafe_b64encode(h.digest()).rstrip(b'=')
     return header_b64 + b'.' + payload_b64 + b'.' + signature_b64
 
 
