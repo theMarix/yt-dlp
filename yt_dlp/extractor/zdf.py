@@ -10,6 +10,7 @@ from ..utils import (
     join_nonempty,
     merge_dicts,
     parse_codecs,
+    parse_qs,
     qualities,
     traverse_obj,
     try_get,
@@ -249,7 +250,10 @@ class ZDFBaseIE(InfoExtractor):
 
 
 class ZDFIE(ZDFBaseIE):
-    _VALID_URL = r'https?://www\.zdf\.de/(?:[^/]+/)*(?P<id>[^/?#&]+)\.html'
+    _VALID_URL = (
+        r'https?://www\.zdf\.de/(?:play/)?(?:video|(?:magazine|reportagen|konzerte|filme)/[^/?#&]+)(?:/[^/?#&]+)*/(?P<id>[^/?#&.]+)',
+        r'https?://www\.zdf\.de/(?:[^/]+/)*(?P<id>[^/?#&]+)\.html',
+    )
     _TESTS = [{
         # Same as https://www.phoenix.de/sendungen/ereignisse/corona-nachgehakt/wohin-fuehrt-der-protest-in-der-pandemie-a-2050630.html
         'url': 'https://www.zdf.de/politik/phoenix-sendungen/wohin-fuehrt-der-protest-in-der-pandemie-100.html',
@@ -471,26 +475,50 @@ class ZDFChannelIE(ZDFBaseIE):
                 'duration': ('length', {float_or_none}),
                 'season_number': ('seasonNumber', {int_or_none}),
                 'episode_number': ('episodeNumber', {int_or_none}),
+                'timestamp': ('visibleFrom', {unified_timestamp}),
             }))
 
     def _entries(self, data, document_id):
+        structure_node_path = traverse_obj(data, ('document', 'structureNodePath'))
+        if structure_node_path:
+            def on_brand(v):
+                return v['structureNodePath'] == structure_node_path
+        else:
+            def on_brand(v):
+                return v['brandId'] == document_id
+
         for entry in traverse_obj(data, (
             'cluster', lambda _, v: v['type'] == 'teaser',
+            'teaser', lambda _, v: v['type'] == 'video' and v.get('contentType') in ('episode', None)
             # If 'brandId' differs, it is a 'You might also like' video. Filter these out
-            'teaser', lambda _, v: v['type'] == 'video' and v['brandId'] == document_id and v['sharingUrl'],
+            and on_brand(v) and v['sharingUrl'],
         )):
             yield self._extract_entry(entry)
 
     def _real_extract(self, url):
         channel_id = self._match_id(url)
         webpage = self._download_webpage(url, channel_id)
-        document_id = self._search_regex(
-            r'docId\s*:\s*(["\'])(?P<doc_id>(?:(?!\1).)+)\1', webpage, 'document id', group='doc_id')
-        data = self._download_v2_doc(document_id)
+        hero_id = self._search_json(
+            re.escape(r'\"heroVideo\":'), webpage, 'hero video', channel_id,
+            transform_source=lambda s: s.encode().decode('unicode_escape'), default={})
+        hero_id = hero_id.get('canonical')
+        if hero_id:
+            return self._extract_mobile(hero_id)
 
+        document_id = self._search_regex(
+            r'docId\s*:\s*(["\'])(?P<doc_id>(?:(?!\1).)+)\1', webpage, 'document id', group='doc_id',
+            default=channel_id)
+        data = self._download_v2_doc(document_id)
+        teaser_content = {'teaserContent'}
+        season_id = parse_qs(url).get('staffel', [None])[-1]
+        if season_id:
+            data['cluster'] = traverse_obj(data, ('cluster', lambda _, v: re.match(rf'Staffel\s+{season_id}(?:\W|$)', v['name'])))
+            teaser_content.add('teaser')
         main_video = traverse_obj(data, (
-            'cluster', lambda _, v: v['type'] == 'teaserContent',
-            'teaser', lambda _, v: v['type'] == 'video' and v['basename'] and v['sharingUrl'], any)) or {}
+            'cluster', lambda _, v: v['type'] in teaser_content,
+            'teaser', lambda _, v: (
+                v['type'] == 'video' and v['basename'] and v['sharingUrl']
+                and v.get('contentType') in ('episode', None)), any)) or {}
 
         if not self._yes_playlist(channel_id, main_video.get('basename')):
             return self._extract_entry(main_video)
